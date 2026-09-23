@@ -12,7 +12,9 @@ dependencies = [
     "jupyter>=1.0.0",
     "nltk>=3.8.1",
     "kafka-python>=2.2.15",
-    "redis>=5.2.1"
+    "redis>=5.2.1",
+    "sentence-transformers>=6.1.0",
+    "torch>=2.6.0",
 ]
 
 [dependency-groups]

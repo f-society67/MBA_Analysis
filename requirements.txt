@@ -7,3 +7,5 @@ notebook
 nltk
 kafka-python
 redis
+sentence-transformers
+torch
