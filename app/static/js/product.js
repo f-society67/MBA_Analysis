@@ -4,13 +4,82 @@ document.addEventListener('DOMContentLoaded', async () => {
     const productId = Number(document.body.dataset.productId);
     const stage = document.querySelector('[data-product-stage]');
     const relatedGrid = document.querySelector('[data-related-grid]');
+    const relatedSection = document.querySelector('[data-related-section]');
+    const nextSection = document.querySelector('[data-next-section]');
+    const nextCard = document.querySelector('[data-next-pick]');
     const basketRecommendationCard = document.querySelector('[data-featured-pairing]');
     const basketRecommendationSection = document.querySelector('[data-featured-section]');
-    const viewStartedAt = performance.now();
+    let viewStartedAt = null;
+    let viewTimer = null;
+    let viewGeneration = 0;
+    const dwellThreshold = Number(document.querySelector('[data-dwell-threshold]')?.dataset?.dwellThreshold || 45);
     let product;
     let viewEnded = false;
     let recommendationRequestId = 0;
     let unsubscribeFromBasket = null;
+    let unsubscribeFromOffers = null;
+    let relatedProducts = [];
+    let availableOffers = [];
+    let offerRequestId = 0;
+    let nextObserver = null;
+    let pageClosed = false;
+    let nextPick = null;
+    let candidateKey = null;
+    const seenNextPicks = new Set();
+
+    function updateOfferLabel() {
+        const label = nextCard.querySelector('[data-next-offer]');
+        if (!nextPick || !label) return;
+        const hasOffer = availableOffers.some(item => item.product_id === nextPick.product_name);
+        label.textContent = hasOffer ? '* Offers available' : '* Explore for potential offers';
+        label.className = `next-pick__offer${hasOffer ? ' next-pick__offer--available' : ''}`;
+    }
+
+    function renderNextRecommendation() {
+        const cartIds = new Set(Market.getCart().map(item => Number(item.product_id)));
+        const candidates = relatedProducts.filter(item => Number(item.product_id) !== productId && !cartIds.has(Number(item.product_id)));
+        const key = candidates.map(item => item.product_id).join(',');
+        if (candidateKey === key) { updateOfferLabel(); return; }
+        candidateKey = key;
+        nextObserver?.disconnect();
+        const recommendation = candidates[0];
+        nextPick = recommendation;
+        nextSection.hidden = !recommendation;
+        nextCard.innerHTML = '';
+        relatedSection.hidden = candidates.length < 2;
+        relatedGrid.innerHTML = candidates.slice(1).map(item => Market.productCard(item, {source: 'product_related'})).join('');
+        if (!recommendation) return;
+        const linkAttributes = `href="/product/${recommendation.product_id}" data-product-link data-source="product_next_pick" data-product-id="${recommendation.product_id}" data-product-name="${Market.escapeHtml(recommendation.product_name)}" data-impression-id="${Market.escapeHtml(recommendation.impression_id || '')}" data-policy-version="${Market.escapeHtml(recommendation.policy_version || '')}" data-snapshot-version="${Market.escapeHtml(recommendation.snapshot_version || '')}"`;
+        nextCard.innerHTML = `${Market.productArtwork(recommendation)}<div class="basket-result__copy"><p class="basket-result__because">${Market.escapeHtml(recommendation.recommendation_reason || 'Suggested from the catalog')}</p><a ${linkAttributes}><h3>${Market.escapeHtml(recommendation.product_name)}</h3></a><p>${Market.money(recommendation.price_inr)} · illustrative price</p><small class="next-pick__offer" data-next-offer></small></div><a class="button button--secondary" ${linkAttributes}>Explore this item${Market.icon('chevron')}</a>`;
+        updateOfferLabel();
+        const impressionKey = `${recommendation.impression_id || ''}:${recommendation.product_id}`;
+        const recordImpression = () => {
+            if (seenNextPicks.has(impressionKey) || pageClosed) return;
+            seenNextPicks.add(impressionKey);
+            Market.publishRecommendationImpression(recommendation, 'product_next_pick').catch(() => {});
+        };
+        if ('IntersectionObserver' in window) {
+            const observer = new window.IntersectionObserver(entries => {
+                if (nextPick !== recommendation || pageClosed) return;
+                if (entries.some(entry => entry.isIntersecting && entry.intersectionRatio >= 0.5)) { recordImpression(); observer.disconnect(); }
+            }, {threshold: 0.5});
+            nextObserver = observer;
+            observer.observe(nextCard);
+        } else recordImpression();
+    }
+
+    async function refreshOffers() {
+        const requestId = ++offerRequestId;
+        try {
+            const offers = await Market.getAvailableOffers();
+            if (requestId !== offerRequestId || pageClosed) return;
+            availableOffers = offers;
+        } catch (_) {
+            if (requestId !== offerRequestId || pageClosed) return;
+            availableOffers = [];
+        }
+        updateOfferLabel();
+    }
 
     function quantityFor(id) { return Market.getCart().find(item => Number(item.product_id) === Number(id))?.quantity || 0; }
     function renderStage() {
@@ -38,7 +107,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             const recommendation = (data.recommendations || []).find(item => !cartIds.has(Number(item.product_id)));
             if (!recommendation) return;
 
-            const sourceLabel = recommendation.recommendation_source === 'historical_rule' ? 'Historical association rule' : 'Catalog fallback';
+            const sourceLabel = recommendation.recommendation_source === 'live_rule'
+                ? (recommendation.rule_source === 'live_synthetic' ? 'Synthetic transaction rule' : 'Live transaction rule')
+                : recommendation.recommendation_source === 'historical_rule' ? 'Historical association rule' : 'Catalog fallback';
             const rankingLabel = recommendation.policy_mode === 'adaptive_linucb' ? 'Live ranked' : 'Historical order';
             const lift = Number(recommendation.lift);
             const liftLabel = Number.isFinite(lift) ? `<span>${Market.escapeHtml(lift.toFixed(2))}× lift</span>` : '';
@@ -53,10 +124,28 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
-    function endView() {
-        if (!product || viewEnded) return; viewEnded = true;
-        const payload = {event_id: `event-${crypto.randomUUID?.() || Date.now()}`, event_type: 'product_view_ended', event_time: new Date().toISOString(), user_id: Market.identity.userId, session_id: Market.identity.sessionId, product_id: product.product_name, catalog_product_id: product.product_id, product_name: product.product_name, dwell_seconds: Math.max(0, Number(((performance.now() - viewStartedAt) / 1000).toFixed(2)))};
-        navigator.sendBeacon?.('/api/events', new Blob([JSON.stringify(payload)], {type: 'application/json'})) || Market.publish('product_view_ended', payload, true).catch(() => {});
+    function endView(unloading = false) {
+        if (!product || viewEnded || viewStartedAt === null) return; viewEnded = true;
+        clearTimeout(viewTimer);
+        const payload = {event_id: `event-${globalThis.crypto?.randomUUID?.() || Date.now()}`, event_type: 'product_view_ended', event_time: new Date().toISOString(), user_id: Market.identity.userId, session_id: Market.identity.sessionId, csrf_token: Market.csrfToken, product_id: product.product_name, catalog_product_id: product.product_id, product_name: product.product_name, dwell_seconds: Math.max(0, Number(((performance.now() - viewStartedAt) / 1000).toFixed(2)))};
+        if (unloading && navigator.sendBeacon?.('/api/events', new Blob([JSON.stringify(payload)], {type: 'application/json'}))) return;
+        Market.publish('product_view_ended', payload, true).catch(() => {});
+    }
+
+    async function startVisibleView() {
+        if (!product || document.visibilityState === 'hidden') return;
+        const generation = ++viewGeneration;
+        clearTimeout(viewTimer);
+        try {
+            await Market.ready;
+            await Market.publish('product_view_started', {product_id: product.product_name,
+                catalog_product_id: product.product_id, product_name: product.product_name});
+            if (generation !== viewGeneration || document.visibilityState === 'hidden') return;
+            viewStartedAt = performance.now(); viewEnded = false;
+            viewTimer = setTimeout(() => {
+                if (document.visibilityState !== 'hidden') endView();
+            }, dwellThreshold * 1000 + 250);
+        } catch (_) { /* A view without a delivered start cannot qualify. */ }
     }
 
     try {
@@ -64,13 +153,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         Market.getCart().forEach(item => detailParams.append('cart_product_id', String(item.product_id)));
         const response = await fetch(`/api/products/${productId}?${detailParams}`); if (!response.ok) throw new Error();
         const data = await response.json(); product = data.product;
-        unsubscribeFromBasket = Market.subscribe(() => { renderStage(); renderBasketRecommendation(); });
+        relatedProducts = data.related_products || [];
+        unsubscribeFromBasket = Market.subscribe(() => { renderStage(); renderNextRecommendation(); renderBasketRecommendation(); refreshOffers(); });
+        unsubscribeFromOffers = Market.subscribeOffers(refreshOffers);
+        renderNextRecommendation();
+        refreshOffers();
         renderStage(); await renderBasketRecommendation();
-        relatedGrid.innerHTML = data.related_products.map(item => Market.productCard(item, {source: 'product_related'})).join('');
-        Market.publish('product_view_started', {product_id: product.product_name, catalog_product_id: product.product_id, product_name: product.product_name, referrer: document.referrer || null}).catch(() => {});
-        data.related_products.forEach(item => Market.publish('recommendation_impression', {product_id: item.product_name, catalog_product_id: item.product_id, product_name: item.product_name, impression_id: item.impression_id, policy_version: item.policy_version, snapshot_version: item.snapshot_version, placement: 'product_related', supporting_product_id: product.product_id}).catch(() => {}));
+        await startVisibleView();
+        relatedProducts.filter(item => Number(item.product_id) !== productId && !quantityFor(item.product_id)).slice(1).forEach(item => Market.publish('recommendation_impression', {product_id: item.product_name, catalog_product_id: item.product_id, product_name: item.product_name, impression_id: item.impression_id, policy_version: item.policy_version, snapshot_version: item.snapshot_version, placement: 'product_related', supporting_product_id: product.product_id}).catch(() => {}));
     } catch (_) {
         stage.innerHTML = '<div class="load-error"><strong>This product could not be loaded.</strong><p>Return to the market and choose another item.</p><a class="button button--primary" href="/">Back to market</a></div>';
     }
-    addEventListener('pagehide', () => { unsubscribeFromBasket?.(); endView(); }, {once: true});
+    addEventListener('pagehide', () => { pageClosed = true; viewGeneration += 1; nextObserver?.disconnect(); unsubscribeFromBasket?.(); unsubscribeFromOffers?.(); endView(true); }, {once: true});
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') { viewGeneration += 1; endView(); }
+        else { startVisibleView(); refreshOffers(); }
+    });
 });

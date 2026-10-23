@@ -1,5 +1,4 @@
-"""Kafka consumer that applies the reference coupon policy."""
-
+"""Recoverable coupon consumer with durable state, outbox, and rejection log."""
 from __future__ import annotations
 
 import argparse
@@ -9,73 +8,58 @@ import os
 import redis
 from kafka import KafkaConsumer, KafkaProducer
 
-from .coupon_engine import CouponEngine
-from .observability import ActivityLog, CouponLedger, RedisCouponClaimStore
+from .durable_coupon import DurableCouponProcessor
+from .coupon_engine import configured_coupon_policy
+from .observability import ActivityLog
 from .rules import RedisRuleLookup
-from .serialization import JsonDeserializer, JsonSerializer
+from .serialization import JsonSerializer
 from .topics import COUPONS_TOPIC, EVENTS_TOPIC
+from .kafka_worker import consume
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--bootstrap-servers", default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
-    parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
-    parser.add_argument("--group-id", default=os.getenv("CONSUMER_GROUP", "mba-reference-engine"))
-    parser.add_argument("--max-events", type=int, default=0, help="stop after this many events; 0 means run forever")
-    args = parser.parse_args()
-
-    redis_client = redis.Redis.from_url(args.redis_url, decode_responses=True)
-    redis_client.ping()
-    activity = ActivityLog(redis_client)
-    coupon_ledger = CouponLedger(redis_client)
-    engine = CouponEngine(
-        RedisRuleLookup(redis_client),
-        dwell_threshold_seconds=float(os.getenv("DWELL_THRESHOLD_SECONDS", "45")),
-        min_lift=float(os.getenv("MIN_LIFT", "1.5")),
-        min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.10")),
-        min_support=float(os.getenv("MIN_SUPPORT", "0.012")),
-        discount_percent=int(os.getenv("DISCOUNT_PERCENT", "5")),
-        claims=RedisCouponClaimStore(redis_client),
-    )
-    consumer = KafkaConsumer(
-        EVENTS_TOPIC,
-        bootstrap_servers=args.bootstrap_servers,
-        group_id=args.group_id,
-        auto_offset_reset="earliest",
-        enable_auto_commit=False,
-        value_deserializer=JsonDeserializer(),
-    )
-    producer = KafkaProducer(
-        bootstrap_servers=args.bootstrap_servers,
-        value_serializer=JsonSerializer(),
-    )
-    processed = 0
+def decode_event(raw):
+    from .contracts import validate_event
     try:
-        for message in consumer:
-            processed += 1
-            decision, reason = engine.evaluate(message.value)
-            activity.record("event_received", {**message.value, "reason": reason})
-            if decision:
-                try:
-                    producer.send(COUPONS_TOPIC, value=decision).get(timeout=10)
-                    coupon_ledger.issue(decision)
-                    activity.record("coupon_issued", decision)
-                    print(json.dumps(decision), flush=True)
-                except Exception:
-                    # The Kafka record has a stable event-derived coupon ID, so
-                    # retrying a partial delivery remains one logical offer.
-                    engine.release_claim(decision)
-                    raise
-            elif message.value["event_type"] == "product_view_ended":
-                activity.record("coupon_suppressed", {**message.value, "reason": reason})
-            consumer.commit()
-            if args.max_events and processed >= args.max_events:
-                break
+        return validate_event(json.loads(raw))
+    except (UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid clickstream event: {exc}") from exc
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--bootstrap-servers', default=os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092'))
+    parser.add_argument('--redis-url', default=os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
+    parser.add_argument('--group-id', default=os.getenv('CONSUMER_GROUP', 'mba-reference-engine'))
+    parser.add_argument('--max-events', type=int, default=0)
+    args = parser.parse_args()
+    client = redis.Redis.from_url(args.redis_url, decode_responses=True)
+    processor = DurableCouponProcessor(client, RedisRuleLookup(client), **configured_coupon_policy())
+    consumer = KafkaConsumer(EVENTS_TOPIC, bootstrap_servers=args.bootstrap_servers,
+        group_id=args.group_id, auto_offset_reset='earliest', enable_auto_commit=False)
+    producer = KafkaProducer(bootstrap_servers=args.bootstrap_servers, value_serializer=JsonSerializer())
+    def publish(decision):
+        producer.send(COUPONS_TOPIC, key=decision['user_id'].encode(), value=decision).get(timeout=10)
+        print(json.dumps(decision), flush=True)
+    def handle(message):
+        try:
+            payload = decode_event(message.value)
+        except ValueError as exc:
+            ActivityLog(client).record('event_rejected', {
+                'reason': str(exc), 'topic': message.topic,
+                'partition': message.partition, 'offset': message.offset,
+                'raw': repr(message.value)[:2048],
+            })
+        else:
+            processor.process(payload)
+    try:
+        consume(consumer, handle, idle=lambda: processor.drain(publish, max_items=1), max_events=args.max_events)
+        processor.drain(publish)
+    except KeyboardInterrupt:
+        pass
     finally:
-        producer.flush()
-        producer.close()
+        producer.close(timeout=5)
         consumer.close()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

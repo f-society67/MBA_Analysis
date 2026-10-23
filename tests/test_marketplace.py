@@ -24,6 +24,10 @@ from pipeline.adaptive_redis import create_redis_adaptive_service
 def client(tmp_path):
     main.app.config.update(TESTING=True, ORDER_STORE_PATH=str(tmp_path / "orders.jsonl"))
     with main.app.test_client() as test_client:
+        with test_client.session_transaction() as session:
+            session['user_id'] = 'shopper-test'
+            session['csrf_token'] = 'test-csrf'
+        test_client.environ_base['HTTP_X_CSRF_TOKEN'] = 'test-csrf'
         yield test_client
 
 
@@ -32,11 +36,12 @@ def test_catalog_only_lists_products_covered_by_the_active_rule_snapshot(client)
     assert response.status_code == 200
     payload = response.get_json()
 
-    assert payload["total"] == 57
+    expected = len(main.catalog_products)
+    assert payload["total"] == expected
     assert payload["pagination"]["page"] == 1
-    assert payload["pagination"]["pages"] == 1
-    assert len(payload["products"]) == 57
-    assert "Banana" in {product["product_name"] for product in payload["products"]}
+    assert payload["pagination"]["pages"] == (expected + 59) // 60
+    assert len(payload["products"]) == min(60, expected)
+    assert main.products_by_id[24852]['product_name'] == 'Banana'
     assert "Smart Ones Classic Favorites Mini Rigatoni With Vodka Cream Sauce" not in {
         product["product_name"] for product in payload["products"]
     }
@@ -73,9 +78,10 @@ def test_deep_linked_product_page_and_detail_api_include_related_products(client
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is required for the browserless UI regression test")
-def test_product_page_renders_a_distinct_basket_supported_recommendation():
+@pytest.mark.parametrize('script', ['product_page_recommendation.mjs', 'coupon_triggers.mjs', 'rules_page.mjs'])
+def test_storefront_recommendations_and_coupon_trigger_interactions(script):
     completed = subprocess.run(
-        ["node", "tests/frontend/product_page_recommendation.mjs"],
+        ["node", f"tests/frontend/{script}"],
         cwd=Path(__file__).parents[1],
         capture_output=True,
         text=True,
@@ -91,6 +97,8 @@ def test_spark_serving_artifact_becomes_versioned_http_prior():
 import json
 from app.main import app
 with app.test_client() as client:
+    with client.session_transaction() as session:
+        session['user_id'] = 'u'
     response = client.get('/api/recommend?item=European%20Cucumber&user_id=u&session_id=s')
     print(json.dumps(response.get_json()))
 """
@@ -140,7 +148,7 @@ with app.test_client() as client:
 def test_cart_recommendation_accepts_catalog_ids_and_excludes_cart(client):
     response = client.post(
         "/api/cart-recommend",
-        json={"cart": [24852], "user_id": "shopper-market", "session_id": "session-market"},
+        json={"cart": [24852], "user_id": "shopper-test", "session_id": "session-market"},
     )
     assert response.status_code == 200
     payload = response.get_json()
@@ -155,6 +163,8 @@ def test_cart_recommendation_accepts_catalog_ids_and_excludes_cart(client):
 
 
 def test_product_recommendations_adapt_after_http_feedback(client, monkeypatch):
+    with client.session_transaction() as session:
+        session['user_id'] = 'adaptive-shopper'
     class Future:
         def get(self, timeout):
             assert timeout == 2
@@ -195,7 +205,23 @@ def test_product_recommendations_adapt_after_http_feedback(client, monkeypatch):
     assert all(item["impression_id"] for item in legacy_route["recommendations"])
 
 
+def test_als_candidate_reaches_the_http_response_with_large_popularity_catalog(client, monkeypatch):
+    from pipeline.candidates import HistoricalCandidates
+    monkeypatch.setattr(main, 'adaptive_service', create_adaptive_service())
+    excluded = {24852} | set(main.rules_df.loc[main.rules_df.antecedent_product_id.eq(24852), 'consequent_product_id'])
+    product_id = next(product_id for product_id in main.products_by_id if product_id not in excluded)
+    monkeypatch.setattr(main, 'historical_candidates', HistoricalCandidates(
+        {str(item['product_id']): 10_000 - index for index, item in enumerate(main.catalog_products)},
+        [{'user_id': 10, 'product_id': product_id, 'score': 1, 'rank': 1}]))
+    payload = client.get('/api/products/24852?user_id=shopper-test&session_id=s').get_json()
+    assert len(payload['related_products']) <= 6
+    assert any(item['product_id'] == product_id and item['recommendation_source'] == 'als_cold_start_fallback'
+               for item in payload['related_products'])
+
+
 def test_product_api_uses_historical_order_when_shared_redis_is_offline(client, monkeypatch):
+    with client.session_transaction() as session:
+        session['user_id'] = 'offline-shopper'
     class UnavailableRedis:
         def incr(self, key):
             del key
@@ -244,6 +270,8 @@ def test_event_api_validates_and_publishes_through_existing_stream_seam(client, 
 
 
 def test_event_api_fails_fast_during_kafka_outage(client, monkeypatch):
+    with client.session_transaction() as session:
+        session['user_id'] = 'offline-shopper'
     send_calls = []
 
     class Producer:
@@ -309,7 +337,10 @@ def test_checkout_persists_a_demo_order_and_owner_can_look_it_up(client, monkeyp
     assert lookup.status_code == 200
     assert lookup.get_json()["order"]["delivery"]["city"] == "Bengaluru"
     assert client.get("/api/orders/BS-test-order-001?user_id=someone-else").status_code == 404
-    assert client.post("/api/checkout", json=checkout).status_code == 409
+    retry = client.post('/api/checkout', json=checkout)
+    assert retry.status_code == 200
+    assert retry.get_json()['order'] == order
+    assert client.post('/api/checkout', json={**checkout, 'city': 'Different city'}).status_code == 409
 
 
 def test_checkout_ignores_unissued_client_discount(client, monkeypatch):
@@ -353,7 +384,7 @@ def test_closed_basket_drawer_is_inert_modal_markup(client):
 def test_available_coupon_api_and_viewer_expose_session_owned_offers(client, monkeypatch):
     class Ledger:
         def available(self, **kwargs):
-            assert kwargs == {"user_id": None, "session_id": None}
+            assert kwargs == {"user_id": 'shopper-test', "session_id": None}
             return [{
                 "coupon_id": "coupon:test",
                 "user_id": "shopper-test",
@@ -369,6 +400,9 @@ def test_available_coupon_api_and_viewer_expose_session_owned_offers(client, mon
     assert response.status_code == 200
     assert response.get_json()["coupons"][0]["session_id"] == "session-test"
     assert response.get_json()["total"] == 1
+    assert client.get('/viewer').status_code == 403
+    with client.session_transaction() as session:
+        session['operator'] = True
     assert b'id="available-coupons"' in client.get("/viewer").data
 
 
@@ -409,7 +443,7 @@ def test_checkout_rejects_empty_or_malformed_orders(client):
     assert "fields" in response.get_json()
 
     response = client.post("/api/checkout", json={
-        "order_id": "BS-empty-order-001", "user_id": "u", "session_id": "s", "name": "A",
+        "order_id": "BS-empty-order-001", "user_id": "shopper-test", "session_id": "s", "name": "A",
         "email": "a@example.com", "address": "Street", "city": "City", "postal_code": "12345", "cart": [],
     })
     assert response.status_code == 400

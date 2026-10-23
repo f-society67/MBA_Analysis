@@ -17,6 +17,8 @@ from .observability import (
 )
 from .adaptive_redis import DEFAULT_ADAPTIVE_NAMESPACE
 from .topics import COUPONS_TOPIC, EVENTS_TOPIC, ensure_topics
+from .durable_coupon import STATE_PREFIX, EVENT_PREFIX, OUTBOX_KEY
+from .live_rules import NAMESPACE as MINING_NAMESPACE
 
 
 def reset_kafka(bootstrap_servers: str) -> None:
@@ -51,7 +53,10 @@ def reset_redis(redis_url: str) -> None:
     coupon_keys = list(client.scan_iter(match=f"{COUPON_KEY_PREFIX}*", count=500))
     claim_keys = list(client.scan_iter(match=f"{COUPON_CLAIM_KEY_PREFIX}*", count=500))
     adaptive_keys = list(client.scan_iter(match=f"{DEFAULT_ADAPTIVE_NAMESPACE}:*", count=500))
-    client.delete(STREAM_KEY, COUNTS_KEY, *coupon_keys, *claim_keys, *adaptive_keys)
+    state_keys = list(client.scan_iter(match=f'{STATE_PREFIX}*', count=500))
+    event_keys = list(client.scan_iter(match=f'{EVENT_PREFIX}*', count=500))
+    mining_keys = list(client.scan_iter(match=f'{MINING_NAMESPACE}:*', count=500))
+    client.delete(STREAM_KEY, COUNTS_KEY, OUTBOX_KEY, *coupon_keys, *claim_keys, *adaptive_keys, *state_keys, *event_keys, *mining_keys)
 
 
 def main() -> None:

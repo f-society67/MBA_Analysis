@@ -11,13 +11,19 @@ mkdir -p "$runtime_dir"
 consumer_pid=""
 simulator_pid=""
 flask_pid=""
+feedback_pid=""
+spark_pid=""
+miner_pid=""
+order_events_pid=""
+export LIVE_RULE_MINING_ENABLED="${LIVE_RULE_MINING_ENABLED:-1}"
+export LIVE_RULES_ALLOW_SYNTHETIC="${LIVE_RULES_ALLOW_SYNTHETIC:-1}"
 
 cleanup() {
   set +e
-  for pid in "$consumer_pid" "$simulator_pid" "$flask_pid"; do
+  for pid in "$consumer_pid" "$simulator_pid" "$flask_pid" "$feedback_pid" "$spark_pid" "$miner_pid" "$order_events_pid"; do
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
   done
-  for pid in "$consumer_pid" "$simulator_pid" "$flask_pid"; do
+  for pid in "$consumer_pid" "$simulator_pid" "$flask_pid" "$feedback_pid" "$spark_pid" "$miner_pid" "$order_events_pid"; do
     [[ -n "$pid" ]] && wait "$pid" 2>/dev/null || true
   done
   if [[ "${KEEP_INFRA:-0}" != "1" ]]; then
@@ -54,26 +60,47 @@ if [[ "$redis_ok" != "1" || "$kafka_ok" != "1" ]]; then
   exit 1
 fi
 
-echo "Resetting ephemeral demo state..."
-uv run python -m pipeline.reset_demo
+if [[ "${RESET_DEMO:-0}" == "1" ]]; then
+  echo "Resetting demo state by explicit request..."
+  uv run python -m pipeline.reset_demo
+fi
 
 echo "Loading the current rule snapshot into Redis..."
 uv run python -m pipeline.load_rules | tee "$runtime_dir/rules.log"
 
-group_id="mba-live-$(date +%s)"
+group_id="${CONSUMER_GROUP:-mba-durable-engine-v2}"
 echo "Starting the stream consumer ($group_id)..."
 uv run python -m pipeline.consumer --group-id "$group_id" \
   > >(tee "$runtime_dir/consumer.log") 2>&1 &
 consumer_pid=$!
 
+echo "Starting adaptive feedback ingestion and outcome settlement..."
+uv run python -m pipeline.feedback_worker >"$runtime_dir/feedback.log" 2>&1 &
+feedback_pid=$!
+echo "Starting durable confirmed-order event delivery..."
+uv run python -m pipeline.order_event_worker >"$runtime_dir/order-events.log" 2>&1 &
+order_events_pid=$!
+
+if [[ "$LIVE_RULE_MINING_ENABLED" == "1" ]]; then
+  echo "Starting validated live association mining (storefront and synthetic cohorts stay separate)..."
+  uv run python -m pipeline.live_rule_worker >"$runtime_dir/rule-miner.log" 2>&1 &
+  miner_pid=$!
+fi
+
+if [[ "${RUN_STRUCTURED_STREAMING:-0}" == "1" ]]; then
+  bash scripts/run_adaptive_stream.sh >"$runtime_dir/spark-stream.log" 2>&1 &
+  spark_pid=$!
+fi
+
 echo "Starting the continuous clickstream simulator..."
 uv run python -m pipeline.live_simulator --interval "${SIMULATOR_INTERVAL:-2}" \
+  --warmup-orders "${SIMULATOR_WARMUP_ORDERS:-300}" \
   > >(tee "$runtime_dir/simulator.log") 2>&1 &
 simulator_pid=$!
 
 echo "Starting the viewer..."
 ADAPTIVE_REDIS_URL="${REDIS_URL:-redis://localhost:6379/0}" \
-  uv run flask --app app.main run --host 0.0.0.0 --port 5000 \
+  uv run flask --app app.main run --host 127.0.0.1 --port 5000 \
   >"$runtime_dir/flask.log" 2>&1 &
 flask_pid=$!
 
@@ -89,13 +116,30 @@ if ! curl -fsS http://127.0.0.1:5000/api/activity >/dev/null 2>&1; then
 fi
 
 echo
-echo "Signal room: http://127.0.0.1:5000/viewer"
+operator_token=$(uv run python -c 'from app.identity import operator_token; print(operator_token())')
+echo "Private signal room: http://127.0.0.1:5000/viewer?token=$operator_token"
 echo "Storefront:  http://127.0.0.1:5000/"
 echo "Runtime logs: $runtime_dir"
 echo "Randomized clickstream is live; decisions appear in the signal room. Press Ctrl-C to stop."
 echo
 
 while true; do
+  if ! kill -0 "$order_events_pid" 2>/dev/null; then
+    echo "Confirmed-order delivery stopped. Check $runtime_dir/order-events.log" >&2
+    exit 1
+  fi
+  if [[ -n "$miner_pid" ]] && ! kill -0 "$miner_pid" 2>/dev/null; then
+    echo "Live rule mining stopped. Check $runtime_dir/rule-miner.log" >&2
+    exit 1
+  fi
+  if [[ -n "$spark_pid" ]] && ! kill -0 "$spark_pid" 2>/dev/null; then
+    echo "Structured Streaming stopped. Check $runtime_dir/spark-stream.log" >&2
+    exit 1
+  fi
+  if ! kill -0 "$feedback_pid" 2>/dev/null; then
+    echo "The adaptive feedback worker stopped. Check $runtime_dir/feedback.log" >&2
+    exit 1
+  fi
   if ! kill -0 "$consumer_pid" 2>/dev/null; then
     echo "The stream consumer stopped. Check $runtime_dir/consumer.log" >&2
     exit 1

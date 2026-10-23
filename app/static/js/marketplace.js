@@ -8,9 +8,11 @@
     const USER_KEY = 'basket-signal-user';
     const SESSION_KEY = 'basket-signal-session';
     const listeners = new Set();
+    const offerListeners = new Set();
     let activitySource = null;
     let drawerReturnFocus = null;
     let cartRecommendationRequest = null;
+    let publishQueue = Promise.resolve();
 
     const safeParse = (value, fallback) => {
         try { return JSON.parse(value) ?? fallback; } catch (_) { return fallback; }
@@ -24,9 +26,10 @@
         } catch (_) { return randomId(prefix); }
     };
     const identity = {
-        userId: storageValue(localStorage, USER_KEY, 'shopper'),
+        userId: document.querySelector('[data-shopper-id]').dataset.shopperId,
         sessionId: storageValue(sessionStorage, SESSION_KEY, 'session'),
     };
+    const csrfToken = document.querySelector('[data-csrf-token]').dataset.csrfToken;
     const COUPON_KEY = `${COUPON_PREFIX}${catalogScope}-${identity.sessionId}`;
     const removeStaleCatalogState = () => {
         try {
@@ -102,12 +105,13 @@
     async function publish(eventType, details = {}, keepalive = false) {
         const payload = {
             event_id: randomId('event'), event_type: eventType, event_time: new Date().toISOString(),
-            user_id: identity.userId, session_id: identity.sessionId, ...details,
+            user_id: identity.userId, session_id: identity.sessionId, csrf_token: csrfToken, ...details,
         };
-        const response = await fetch('/api/events', {
+        publishQueue = publishQueue.catch(() => {}).then(() => fetch('/api/events', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(payload), keepalive,
-        });
+        }));
+        const response = await publishQueue;
         if (!response.ok) throw new Error('Live event stream unavailable');
         return payload;
     }
@@ -128,7 +132,7 @@
         persist();
         publish('cart_item_added', {
             product_id: product.product_name, catalog_product_id: product.product_id,
-            product_name: product.product_name, quantity, source,
+            product_name: product.product_name, quantity, cart_quantity: cart[id].quantity, source,
             impression_id: product.impression_id, policy_version: product.policy_version,
             snapshot_version: product.snapshot_version,
         }).catch(() => toast('Added locally. The live event stream is offline.'));
@@ -144,7 +148,7 @@
         persist();
         publish(change > 0 ? 'cart_item_added' : 'cart_item_removed', {
             product_id: product.product_name, catalog_product_id: product.product_id,
-            product_name: product.product_name, quantity: Math.abs(change), source: 'basket',
+            product_name: product.product_name, quantity: Math.abs(change), cart_quantity: Math.max(0, next), source: 'basket',
         }).catch(() => {});
     }
 
@@ -153,11 +157,11 @@
         coupons[id] = {...coupon, product_id: product.product_id, product_name: product.product_name};
         if (!cart[id]) cart[id] = {...product, quantity: 1};
         persist();
-        publish('coupon_applied', {
+        synchronizeCart().then(() => publish('coupon_applied', {
             product_id: product.product_name, catalog_product_id: product.product_id,
             product_name: product.product_name, coupon_id: coupon.coupon_id,
             discount_percent: Number(coupon.discount_percent),
-        }).catch(() => {});
+        })).catch(() => {});
         toast(`${coupon.discount_percent}% coupon applied`);
     }
 
@@ -199,7 +203,7 @@
 
         const promise = fetch('/api/cart-recommend', {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken},
             body: JSON.stringify({cart: cartIds, user_id: identity.userId, session_id: identity.sessionId}),
         }).then(response => {
             if (!response.ok) throw new Error('Basket recommendations unavailable');
@@ -242,6 +246,7 @@
         drawer.removeAttribute('inert'); drawer.setAttribute('aria-hidden', 'false'); document.body.classList.add('drawer-open');
         document.querySelectorAll('[data-open-cart]').forEach(button => button.setAttribute('aria-expanded', 'true'));
         drawer.querySelector('[data-close-cart]')?.focus();
+        publish('basket_opened').catch(() => {});
     }
     function closeCart() {
         const drawer = document.querySelector('#cart-drawer'); const scrim = document.querySelector('[data-cart-scrim]');
@@ -254,6 +259,7 @@
     }
 
     async function handleOffer(payload) {
+        offerListeners.forEach(listener => listener());
         let product = getCart().find(item => item.product_name === payload.product_id);
         if (!product) {
             try {
@@ -287,13 +293,24 @@
         if (event.target.closest('[data-open-cart]')) { openCart(); return; }
         if (event.target.closest('[data-close-cart], [data-cart-scrim]')) { closeCart(); return; }
         const productLink = event.target.closest('[data-product-link]');
-        if (productLink && productLink.dataset.source !== 'catalog') publish('recommendation_clicked', {
+        if (!productLink || productLink.dataset.source === 'catalog' || event.defaultPrevented) return;
+        const sameTab = event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey
+            && (!productLink.target || productLink.target === '_self');
+        if (sameTab) event.preventDefault();
+        const delivery = publish('recommendation_clicked', {
             product_id: productLink.dataset.productName, catalog_product_id: Number(productLink.dataset.productId),
             product_name: productLink.dataset.productName, impression_id: productLink.dataset.impressionId || undefined,
             policy_version: productLink.dataset.policyVersion || undefined,
             snapshot_version: productLink.dataset.snapshotVersion || undefined,
             placement: productLink.dataset.source,
         }, true).catch(() => {});
+        if (sameTab) {
+            // Keep the cart and click in order before leaving this document.
+            // An offline event pipeline must not prevent product browsing.
+            let navigationTimer;
+            Promise.race([delivery, new Promise(resolve => { navigationTimer = setTimeout(resolve, 2500); })])
+                .then(() => { clearTimeout(navigationTimer); window.location.assign(productLink.href); });
+        }
     });
     document.addEventListener('keydown', event => {
         const drawer = document.querySelector('#cart-drawer');
@@ -313,12 +330,25 @@
     document.querySelectorAll('[data-checkout-link]').forEach(link => link.addEventListener('click', event => { if (!getCart().length) event.preventDefault(); }));
 
     window.BasketSignal = {
-        identity, escapeHtml, money, titleCase, icon, productArtwork, productCard,
+        identity, csrfToken, escapeHtml, money, titleCase, icon, productArtwork, productCard,
         publish, publishRecommendationImpression, getCartRecommendations,
         toast, addProduct, changeQuantity, getCart, getCoupons, totals, persist,
         subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
-        clearOrder() { cart = {}; coupons = {}; localStorage.removeItem(CART_KEY); sessionStorage.removeItem(COUPON_KEY); persist(); },
+        subscribeOffers(listener) { offerListeners.add(listener); return () => offerListeners.delete(listener); },
+        async getAvailableOffers() {
+            const params = new URLSearchParams({user_id: identity.userId, session_id: identity.sessionId});
+            const response = await fetch(`/api/coupons/available?${params}`);
+            if (!response.ok) throw new Error('Available offers could not be checked');
+            return (await response.json()).coupons || [];
+        },
+        clearOrder() { cart = {}; coupons = {}; localStorage.removeItem(CART_KEY); sessionStorage.removeItem(COUPON_KEY); persist(); synchronizeCart().catch(() => {}); },
         newOrderId() { return `BS-${(globalThis.crypto?.randomUUID?.() || randomId('order')).replace(/[^A-Za-z0-9-]/g, '')}`; },
     };
+    function synchronizeCart() {
+        return publish('cart_synchronized', {cart: getCart().map(item => ({
+            product_id: item.product_name, catalog_product_id: item.product_id, quantity: item.quantity,
+        }))});
+    }
+    window.BasketSignal.ready = synchronizeCart().catch(() => {});
     renderCart(); connectActivity();
 })();
