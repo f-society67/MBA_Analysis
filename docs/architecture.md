@@ -46,15 +46,61 @@ All events are JSON objects with these fields:
 | Field | Meaning |
 |---|---|
 | `event_id` | Globally unique event identifier |
-| `event_type` | `product_view_started`, `product_view_ended`, `cart_item_added`, or `cart_item_removed` |
+| `event_type` | Product view/cart events plus `search_performed`, recommendation impression/click, coupon application, and checkout start/completion |
 | `event_time` | ISO-8601 UTC timestamp |
 | `user_id` | Shopper identity used for stream state |
 | `session_id` | Session identity used to isolate carts and views |
-| `product_id` | Canonical product identity; current demo uses representative names |
+| `product_id` | Display/product-rule identity; required for product, cart, recommendation, and coupon events |
+| `catalog_product_id` | Stable numeric catalog identity preferred by adaptive features and marketplace ranking |
 | `dwell_seconds` | Required for `product_view_ended`; optional when it can be derived later |
 | `quantity` | Optional quantity for cart events, defaulting to one |
 
+Search events require `query`. Checkout events require `order_id` and may carry
+`product_ids`. Recommendation feedback should carry the `impression_id` and
+`policy_version` returned by the ranking service so the reward is attributed to
+the exact displayed decision. The base identity and event-time fields remain
+required for every event.
+
+## Adaptive decision layer
+
+The historical artifact is a versioned candidate snapshot, not the permanent
+decision engine. `AdaptiveRankingService` starts from each candidate's prior
+score and derives bounded live features at four scopes: session/product,
+shopper/product, aggregate product response, and product pairs represented in
+the active cart. A deterministic disjoint LinUCB policy adds a learned estimate
+and an exploration bonus. Each returned item includes these score components
+and per-feature contributions for auditability.
+
+The service writes the full displayed impression before it can consume click,
+cart, coupon, or checkout reward. It rejects unattributed feedback and duplicate
+IDs within the local 50,000-event or shared Redis 24-hour retention horizon.
+Candidate ordering falls back to the validated historical prior when
+the learning-state adapter is unavailable.
+
+Coupon controls do not form part of the reward model. Minimum lift, confidence,
+and support; supporting-cart membership; target-not-in-cart; and one offer per
+shopper/product are enforced before ranking. This prevents exploration from
+making an unsafe coupon eligible.
+
+`pipeline.adaptive_streaming` is the Spark Structured Streaming entry point. It
+parses Kafka values through an explicit schema, converts the supplied ISO-8601
+time for event-time processing, applies a watermark, and configures the query's
+checkpoint directory. `AdaptiveForeachBatch` is the tested boundary that
+validates rows and normalizes catalog IDs before updating live features. The
+in-memory store supports deterministic coursework replay. The Redis adapter
+shares features, impressions, LinUCB matrices, decision sequencing, and event
+claims across Flask and Spark processes; its cross-instance test proves stream
+feedback changes a later marketplace-worker ranking. Shared feedback mutations
+and their event claim commit atomically; feature and model keys expire after
+seven days, while event claims and impressions use a 24-hour horizon. Invalid
+JSON and timestamps retain Kafka metadata and are written to the configured
+dead-letter JSONL sink.
+
 Coupon output events add `coupon_id`, `discount_percent`, `supporting_cart_item`, `lift`, `confidence`, `support`, and a `reason` object containing the dwell threshold and observed dwell time.
+
+Issued coupon records have unique event-derived IDs, seven-day retention, and
+an atomic one-order claim. Repeating the same order ID is recoverable; a second
+order cannot reuse the coupon, and the explicit demo reset clears the ledger.
 
 The clickstream topic is partitioned by `user_id` so all state-mutating events for one shopper are ordered within a partition.
 
@@ -73,9 +119,10 @@ The demo defaults are deliberately explicit and configurable:
 - Discount: 5 percent
 - A coupon is issued only when the viewed product is not already in the cart.
 - The strongest qualifying supporting cart item wins.
-- A user/product pair receives at most one coupon decision per engine lifetime.
+- A shopper/session/product combination receives at most one coupon while the
+  seven-day Redis claim is active, including across consumer restarts.
 
-The storefront publishes events for its own browser-scoped `user_id` and `session_id`, and filters coupon activity back to that same pair. The Signal Room intentionally remains global for operators. Dwell time alone is not sufficient: the association must also pass the rule-quality thresholds. This is a demonstration policy, not evidence that a 5% discount increases conversion. Evaluation and guardrails are separate work.
+The storefront publishes events for its own browser-scoped `user_id` and `session_id`, and filters coupon activity back to that same pair. Coupon issuance, browser storage, and redemption are session-owned: the same product is capped once per session, and a coupon cannot be applied by another session. The Signal Room intentionally remains global for operators and labels each active, unredeemed coupon with its owning shopper and session. Dwell time alone is not sufficient: the association must also pass the rule-quality thresholds. This is a demonstration policy, not evidence that a 5% discount increases conversion. Evaluation and guardrails are separate work.
 
 ## Batch rules: correctness requirements
 
@@ -85,6 +132,19 @@ The existing notebook has a correctness defect: it converts every antecedent and
 2. explicitly filter to one-item antecedents and one-item consequents before publishing a rule snapshot.
 
 For the first coupon policy, option 2 keeps the serving contract small and auditable. Rules should be deduplicated by `(antecedent, consequent)` using the strongest retained metric row, with the batch run ID and thresholds stored alongside the snapshot.
+
+## Implemented historical bootstrap
+
+`pipeline.spark_bootstrap` implements the replacement Spark job. It reads all
+six CSV tables with explicit schemas, validates required values, identifiers,
+domains, duplicate facts and foreign-key coverage, then writes a versioned run
+under `data/processed/bootstrap`. FP-Growth retains its itemset arrays and
+filters explicitly to one-item antecedents and consequents before deterministic
+pair deduplication. The job also exports implicit-feedback ALS candidates when
+the configured slice supports training. Each run includes Parquet, inspectable
+JSON, a Redis-loader-compatible rule CSV, and a manifest with sources,
+parameters, counts, runtime, Spark metadata and output paths. The exact local
+and Docker commands are in [`spark_bootstrap.md`](spark_bootstrap.md).
 
 ## Delivery phases
 

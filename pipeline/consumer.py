@@ -10,7 +10,7 @@ import redis
 from kafka import KafkaConsumer, KafkaProducer
 
 from .coupon_engine import CouponEngine
-from .observability import ActivityLog
+from .observability import ActivityLog, CouponLedger, RedisCouponClaimStore
 from .rules import RedisRuleLookup
 from .serialization import JsonDeserializer, JsonSerializer
 from .topics import COUPONS_TOPIC, EVENTS_TOPIC
@@ -27,6 +27,7 @@ def main() -> None:
     redis_client = redis.Redis.from_url(args.redis_url, decode_responses=True)
     redis_client.ping()
     activity = ActivityLog(redis_client)
+    coupon_ledger = CouponLedger(redis_client)
     engine = CouponEngine(
         RedisRuleLookup(redis_client),
         dwell_threshold_seconds=float(os.getenv("DWELL_THRESHOLD_SECONDS", "45")),
@@ -34,6 +35,7 @@ def main() -> None:
         min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.10")),
         min_support=float(os.getenv("MIN_SUPPORT", "0.012")),
         discount_percent=int(os.getenv("DISCOUNT_PERCENT", "5")),
+        claims=RedisCouponClaimStore(redis_client),
     )
     consumer = KafkaConsumer(
         EVENTS_TOPIC,
@@ -54,9 +56,16 @@ def main() -> None:
             decision, reason = engine.evaluate(message.value)
             activity.record("event_received", {**message.value, "reason": reason})
             if decision:
-                producer.send(COUPONS_TOPIC, value=decision).get(timeout=10)
-                activity.record("coupon_issued", decision)
-                print(json.dumps(decision), flush=True)
+                try:
+                    producer.send(COUPONS_TOPIC, value=decision).get(timeout=10)
+                    coupon_ledger.issue(decision)
+                    activity.record("coupon_issued", decision)
+                    print(json.dumps(decision), flush=True)
+                except Exception:
+                    # The Kafka record has a stable event-derived coupon ID, so
+                    # retrying a partial delivery remains one logical offer.
+                    engine.release_claim(decision)
+                    raise
             elif message.value["event_type"] == "product_view_ended":
                 activity.record("coupon_suppressed", {**message.value, "reason": reason})
             consumer.commit()
